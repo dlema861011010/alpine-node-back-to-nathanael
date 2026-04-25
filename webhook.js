@@ -8,6 +8,7 @@
  *   STRIPE_WEBHOOK_SECRET  – Signing secret from the Stripe dashboard / CLI
  *   FUSE_FLASH_RPC_URL     – JSON-RPC endpoint for the FuseFlash network
  *   PRIVATE_KEY            – Private key of the USDC-dispensing wallet
+ *   USDC_ADDRESS           – ERC-20 USDC contract address on FuseFlash
  *   PORT                   – (optional) HTTP port, defaults to 3000
  */
 
@@ -18,9 +19,12 @@ const express = require('express');
 const app = express();
 
 // ── USDC contract ────────────────────────────────────────────────────────────
-// Standard ERC-20 USDC address on FuseFlash (replace if the chain uses a
-// different deployment address).
-const USDC_ADDRESS = process.env.USDC_ADDRESS || '0x620fd5fa44BE6af63715Ef4E65DDFA0387aD13F';
+// Standard ERC-20 USDC address on FuseFlash.
+// Must be set via the USDC_ADDRESS environment variable for the target network.
+const USDC_ADDRESS = process.env.USDC_ADDRESS;
+if (!USDC_ADDRESS || !ethers.isAddress(USDC_ADDRESS)) {
+  throw new Error('USDC_ADDRESS environment variable is missing or invalid.');
+}
 
 // Minimal ERC-20 ABI – only the `transfer` function is needed here.
 const USDC_ABI = [
@@ -52,20 +56,19 @@ app.post(
       );
     } catch (err) {
       console.error('Webhook signature verification failed:', err.message);
-      return res.status(400).send(`Webhook Error: ${err.message}`);
+      // Send a plain-text error; do not reflect err.message into HTML context.
+      return res.status(400).type('text').send('Webhook signature verification failed.');
     }
 
-    // 2. Acknowledge receipt immediately so Stripe doesn't retry.
-    res.json({ received: true });
-
-    // 3. Process the event asynchronously after the response is sent.
+    // 2. For payment_intent.succeeded, run idempotency check before ack so
+    //    concurrent duplicate deliveries cannot both pass the guard.
     if (event.type === 'payment_intent.succeeded') {
       const paymentIntent = event.data.object;
 
       // Idempotency: skip if we already processed this PaymentIntent.
       if (paymentIntent.metadata.usdc_sent === 'true') {
         console.log(`PaymentIntent ${paymentIntent.id} already processed – skipping.`);
-        return;
+        return res.json({ received: true });
       }
 
       const userWallet = paymentIntent.metadata.wallet_address;
@@ -73,20 +76,23 @@ app.post(
         console.error(
           `PaymentIntent ${paymentIntent.id}: invalid or missing wallet_address in metadata.`,
         );
-        return;
+        return res.json({ received: true });
       }
+
+      // Acknowledge receipt so Stripe won't retry while the transfer runs.
+      res.json({ received: true });
 
       // Stripe amounts are in the currency's smallest unit (cents for USD).
       // USDC uses 6 decimal places, so 1 USD = 1 USDC = 1_000_000 base units.
-      const amountInUsdc = paymentIntent.amount / 100;
+      const amountUsd = paymentIntent.amount / 100;
       console.log(
-        `Payment confirmed (${paymentIntent.id})! Sending ${amountInUsdc} USDC to ${userWallet} on FuseFlash…`,
+        `Payment confirmed (${paymentIntent.id})! Sending ${amountUsd} USDC to ${userWallet} on FuseFlash…`,
       );
 
       try {
         const tx = await usdcContract.transfer(
           userWallet,
-          ethers.parseUnits(amountInUsdc.toString(), 6),
+          ethers.parseUnits(amountUsd.toString(), 6),
         );
         await tx.wait();
         console.log(`On-chain transfer successful: ${tx.hash}`);
@@ -96,10 +102,17 @@ app.post(
           metadata: { usdc_sent: 'true' },
         });
       } catch (blockchainErr) {
-        console.error('Blockchain transfer failed:', blockchainErr);
+        console.error(
+          `Blockchain transfer failed for PaymentIntent ${paymentIntent.id}:`,
+          blockchainErr,
+        );
         // TODO: implement a retry queue or alerting system (e.g. SQS, PagerDuty).
       }
+      return;
     }
+
+    // 3. Acknowledge all other event types.
+    res.json({ received: true });
   },
 );
 
